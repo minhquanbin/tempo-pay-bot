@@ -1,4 +1,4 @@
-# bot.py — Tempo Payment Bot with Import/Export Wallet
+# bot.py — Tempo Payment Bot with Import/Export Wallet (Fixed for Railway)
 
 import time
 import sqlite3
@@ -8,6 +8,7 @@ import os
 from datetime import datetime
 from dotenv import load_dotenv
 from functools import wraps
+from contextlib import contextmanager
 
 from telegram import (
     Update,
@@ -42,6 +43,7 @@ TEMPO_CHAIN_ID = 42429
 TEMPO_FAUCET = "https://docs.tempo.xyz/quickstart/faucet"
 
 DB_FILE = "tempo.db"
+DB_TIMEOUT = 30.0  # Increased timeout for Railway
 
 RPC_CALL_DELAY = 2.0
 MAX_RETRIES = 3
@@ -82,6 +84,7 @@ w3 = Web3(Web3.HTTPProvider(TEMPO_RPC))
 
 last_rpc_call = 0
 rpc_lock = asyncio.Lock()
+db_lock = asyncio.Lock()
 
 def rate_limited_rpc_call(func):
     @wraps(func)
@@ -123,107 +126,155 @@ else:
 
 bot_instance = None
 
-# ================= DATABASE =================
+# ================= DATABASE WITH PROPER LOCKING =================
+
+@contextmanager
+def get_db_connection():
+    """Context manager for database connections with proper timeout and isolation"""
+    conn = None
+    try:
+        conn = sqlite3.connect(
+            DB_FILE,
+            timeout=DB_TIMEOUT,
+            isolation_level='DEFERRED',
+            check_same_thread=False
+        )
+        conn.execute("PRAGMA journal_mode=WAL")  # Write-Ahead Logging for better concurrency
+        conn.execute("PRAGMA busy_timeout=30000")  # 30 second busy timeout
+        yield conn
+        conn.commit()
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        raise e
+    finally:
+        if conn:
+            conn.close()
+
 
 def init_db():
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.cursor()
+    """Initialize database with retry logic"""
+    max_attempts = 5
+    for attempt in range(max_attempts):
+        try:
+            with get_db_connection() as conn:
+                cur = conn.cursor()
+                
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS wallets (
+                        telegram_id INTEGER PRIMARY KEY,
+                        tempo_address TEXT,
+                        tempo_private_key TEXT,
+                        ton_address TEXT,
+                        notifications_enabled INTEGER DEFAULT 1,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                    """
+                )
+                
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS recipients (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        telegram_id INTEGER,
+                        nickname TEXT,
+                        address TEXT,
+                        blockchain TEXT,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        UNIQUE(telegram_id, nickname)
+                    )
+                    """
+                )
+                
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS transactions (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        tx_hash TEXT UNIQUE,
+                        from_telegram_id INTEGER,
+                        from_address TEXT,
+                        to_address TEXT,
+                        amount TEXT,
+                        token TEXT,
+                        memo TEXT,
+                        notification_sent INTEGER DEFAULT 0,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                    """
+                )
+                
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS sync_state (
+                        id INTEGER PRIMARY KEY,
+                        last_block INTEGER DEFAULT 0
+                    )
+                    """
+                )
+                
+                cur.execute("INSERT OR IGNORE INTO sync_state (id, last_block) VALUES (1, 0)")
+                
+                # Create indexes for better performance
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_transactions_from ON transactions(from_address)")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_transactions_to ON transactions(to_address)")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_transactions_notification ON transactions(notification_sent)")
+                
+                print("✓ Database initialized successfully")
+                return True
+                
+        except sqlite3.OperationalError as e:
+            if "locked" in str(e).lower():
+                print(f"✗ Database locked, attempt {attempt + 1}/{max_attempts}")
+                time.sleep(2 ** attempt)  # Exponential backoff
+                continue
+            raise e
+        except Exception as e:
+            print(f"✗ Database initialization error: {e}")
+            raise e
     
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS wallets (
-            telegram_id INTEGER PRIMARY KEY,
-            tempo_address TEXT,
-            tempo_private_key TEXT,
-            ton_address TEXT,
-            notifications_enabled INTEGER DEFAULT 1,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-        """
-    )
-    
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS recipients (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            telegram_id INTEGER,
-            nickname TEXT,
-            address TEXT,
-            blockchain TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE(telegram_id, nickname)
-        )
-        """
-    )
-    
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS transactions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            tx_hash TEXT UNIQUE,
-            from_telegram_id INTEGER,
-            from_address TEXT,
-            to_address TEXT,
-            amount TEXT,
-            token TEXT,
-            memo TEXT,
-            notification_sent INTEGER DEFAULT 0,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-        """
-    )
-    
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS sync_state (
-            id INTEGER PRIMARY KEY,
-            last_block INTEGER DEFAULT 0
-        )
-        """
-    )
-    
-    cur.execute("INSERT OR IGNORE INTO sync_state (id, last_block) VALUES (1, 0)")
-    
-    conn.commit()
-    conn.close()
+    raise Exception("Failed to initialize database after maximum attempts")
 
 
 def get_wallet(tg_id):
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT tempo_address, tempo_private_key, ton_address FROM wallets WHERE telegram_id=?",
-        (tg_id,),
-    )
-    row = cur.fetchone()
-    conn.close()
-    return row
+    try:
+        with get_db_connection() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT tempo_address, tempo_private_key, ton_address FROM wallets WHERE telegram_id=?",
+                (tg_id,),
+            )
+            row = cur.fetchone()
+            return row
+    except Exception as e:
+        print(f"Error getting wallet: {e}")
+        return None
 
 
 def create_tempo_wallet(tg_id):
-    acct = Account.create(secrets.token_hex(32))
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.cursor()
-    cur.execute(
-        "INSERT OR REPLACE INTO wallets (telegram_id, tempo_address, tempo_private_key) VALUES (?,?,?)",
-        (tg_id, acct.address, acct.key.hex()),
-    )
-    conn.commit()
-    conn.close()
-    return acct.address
+    try:
+        acct = Account.create(secrets.token_hex(32))
+        with get_db_connection() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "INSERT OR REPLACE INTO wallets (telegram_id, tempo_address, tempo_private_key) VALUES (?,?,?)",
+                (tg_id, acct.address, acct.key.hex()),
+            )
+        return acct.address
+    except Exception as e:
+        print(f"Error creating wallet: {e}")
+        return None
 
 
 def import_tempo_wallet(tg_id, private_key):
     try:
         acct = Account.from_key(private_key)
-        conn = sqlite3.connect(DB_FILE)
-        cur = conn.cursor()
-        cur.execute(
-            "INSERT OR REPLACE INTO wallets (telegram_id, tempo_address, tempo_private_key) VALUES (?,?,?)",
-            (tg_id, acct.address, private_key),
-        )
-        conn.commit()
-        conn.close()
+        with get_db_connection() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "INSERT OR REPLACE INTO wallets (telegram_id, tempo_address, tempo_private_key) VALUES (?,?,?)",
+                (tg_id, acct.address, private_key),
+            )
         return acct.address
     except Exception as e:
         print(f"Import wallet error: {e}")
@@ -231,95 +282,105 @@ def import_tempo_wallet(tg_id, private_key):
 
 
 def get_telegram_id_by_address(address):
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT telegram_id FROM wallets WHERE LOWER(tempo_address)=LOWER(?)",
-        (address,),
-    )
-    row = cur.fetchone()
-    conn.close()
-    return row[0] if row else None
+    try:
+        with get_db_connection() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT telegram_id FROM wallets WHERE LOWER(tempo_address)=LOWER(?)",
+                (address,),
+            )
+            row = cur.fetchone()
+            return row[0] if row else None
+    except Exception as e:
+        print(f"Error getting telegram ID: {e}")
+        return None
 
 
 def save_transaction(tx_hash, from_tg_id, from_addr, to_addr, amount, token, memo):
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.cursor()
     try:
-        cur.execute(
-            """INSERT INTO transactions 
-            (tx_hash, from_telegram_id, from_address, to_address, amount, token, memo) 
-            VALUES (?,?,?,?,?,?,?)""",
-            (tx_hash, from_tg_id, from_addr, to_addr, amount, token, memo)
-        )
-        conn.commit()
-    except sqlite3.IntegrityError:
-        pass
-    conn.close()
+        with get_db_connection() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                """INSERT OR IGNORE INTO transactions 
+                (tx_hash, from_telegram_id, from_address, to_address, amount, token, memo) 
+                VALUES (?,?,?,?,?,?,?)""",
+                (tx_hash, from_tg_id, from_addr, to_addr, amount, token, memo)
+            )
+    except Exception as e:
+        print(f"Error saving transaction: {e}")
 
 
 def mark_notification_sent(tx_hash):
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.cursor()
-    cur.execute(
-        "UPDATE transactions SET notification_sent=1 WHERE tx_hash=?",
-        (tx_hash,)
-    )
-    conn.commit()
-    conn.close()
+    try:
+        with get_db_connection() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "UPDATE transactions SET notification_sent=1 WHERE tx_hash=?",
+                (tx_hash,)
+            )
+    except Exception as e:
+        print(f"Error marking notification: {e}")
 
 
 def save_recipient(tg_id, nickname, address, blockchain="tempo"):
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.cursor()
     try:
-        cur.execute(
-            "INSERT INTO recipients (telegram_id, nickname, address, blockchain) VALUES (?,?,?,?)",
-            (tg_id, nickname, address, blockchain),
-        )
-        conn.commit()
-        success = True
+        with get_db_connection() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "INSERT INTO recipients (telegram_id, nickname, address, blockchain) VALUES (?,?,?,?)",
+                (tg_id, nickname, address, blockchain),
+            )
+        return True
     except sqlite3.IntegrityError:
-        success = False
-    conn.close()
-    return success
+        return False
+    except Exception as e:
+        print(f"Error saving recipient: {e}")
+        return False
 
 
 def get_recipients(tg_id):
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT nickname, address, blockchain FROM recipients WHERE telegram_id=? ORDER BY created_at DESC",
-        (tg_id,),
-    )
-    rows = cur.fetchall()
-    conn.close()
-    return rows
+    try:
+        with get_db_connection() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT nickname, address, blockchain FROM recipients WHERE telegram_id=? ORDER BY created_at DESC",
+                (tg_id,),
+            )
+            rows = cur.fetchall()
+            return rows
+    except Exception as e:
+        print(f"Error getting recipients: {e}")
+        return []
 
 
 def get_recipient_by_nickname(tg_id, nickname):
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT address, blockchain FROM recipients WHERE telegram_id=? AND nickname=?",
-        (tg_id, nickname),
-    )
-    row = cur.fetchone()
-    conn.close()
-    return row
+    try:
+        with get_db_connection() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT address, blockchain FROM recipients WHERE telegram_id=? AND nickname=?",
+                (tg_id, nickname),
+            )
+            row = cur.fetchone()
+            return row
+    except Exception as e:
+        print(f"Error getting recipient: {e}")
+        return None
 
 
 def delete_recipient(tg_id, nickname):
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.cursor()
-    cur.execute(
-        "DELETE FROM recipients WHERE telegram_id=? AND nickname=?",
-        (tg_id, nickname),
-    )
-    conn.commit()
-    deleted = cur.rowcount > 0
-    conn.close()
-    return deleted
+    try:
+        with get_db_connection() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "DELETE FROM recipients WHERE telegram_id=? AND nickname=?",
+                (tg_id, nickname),
+            )
+            deleted = cur.rowcount > 0
+            return deleted
+    except Exception as e:
+        print(f"Error deleting recipient: {e}")
+        return False
 
 
 # ================= NOTIFICATION SYSTEM =================
@@ -355,29 +416,30 @@ async def send_payment_notification(telegram_id, from_addr, amount, token, memo,
 
 
 async def check_pending_notifications():
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.cursor()
-    
-    cur.execute(
-        """SELECT tx_hash, from_telegram_id, from_address, to_address, amount, token, memo 
-        FROM transactions 
-        WHERE notification_sent=0"""
-    )
-    
-    pending = cur.fetchall()
-    conn.close()
-    
-    for tx_hash, from_tg_id, from_addr, to_addr, amount, token, memo in pending:
-        recipient_tg_id = get_telegram_id_by_address(to_addr)
-        
-        if recipient_tg_id and recipient_tg_id != from_tg_id:
-            success = await send_payment_notification(
-                recipient_tg_id, from_addr, amount, token, memo, tx_hash
+    try:
+        with get_db_connection() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                """SELECT tx_hash, from_telegram_id, from_address, to_address, amount, token, memo 
+                FROM transactions 
+                WHERE notification_sent=0
+                LIMIT 10"""
             )
+            pending = cur.fetchall()
+        
+        for tx_hash, from_tg_id, from_addr, to_addr, amount, token, memo in pending:
+            recipient_tg_id = get_telegram_id_by_address(to_addr)
             
-            if success:
-                mark_notification_sent(tx_hash)
-                await asyncio.sleep(1)
+            if recipient_tg_id and recipient_tg_id != from_tg_id:
+                success = await send_payment_notification(
+                    recipient_tg_id, from_addr, amount, token, memo, tx_hash
+                )
+                
+                if success:
+                    mark_notification_sent(tx_hash)
+                    await asyncio.sleep(1)
+    except Exception as e:
+        print(f"✗ Notification check error: {e}")
 
 
 async def notification_worker(application):
@@ -512,14 +574,18 @@ async def create_wallet_handler(update: Update, context: ContextTypes.DEFAULT_TY
     await q.answer()
     
     addr = create_tempo_wallet(q.from_user.id)
-    await q.message.reply_text(
-        f"✅ <b>Tempo wallet created!</b>\n\n"
-        f"<code>{addr}</code>\n\n"
-        f"💡 Fund this wallet to start sending payments\n"
-        f"🚰 Faucet: {TEMPO_FAUCET}\n\n"
-        f"🔔 You'll receive notifications when someone sends you payment!",
-        parse_mode="HTML"
-    )
+    
+    if addr:
+        await q.message.reply_text(
+            f"✅ <b>Tempo wallet created!</b>\n\n"
+            f"<code>{addr}</code>\n\n"
+            f"💡 Fund this wallet to start sending payments\n"
+            f"🚰 Faucet: {TEMPO_FAUCET}\n\n"
+            f"🔔 You'll receive notifications when someone sends you payment!",
+            parse_mode="HTML"
+        )
+    else:
+        await q.message.reply_text("❌ Failed to create wallet. Please try again.")
 
 
 async def import_wallet_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -583,9 +649,6 @@ async def history_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.cursor()
-    
     wallet = get_wallet(q.from_user.id)
     if not wallet:
         await q.message.reply_text("No wallet found")
@@ -593,25 +656,30 @@ async def history_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     user_address = wallet[0].lower()
     
-    cur.execute(
-        """SELECT tx_hash, to_address, amount, token, memo, created_at 
-        FROM transactions 
-        WHERE LOWER(from_address)=? 
-        ORDER BY created_at DESC LIMIT 10""",
-        (user_address,)
-    )
-    sent_txs = cur.fetchall()
-    
-    cur.execute(
-        """SELECT tx_hash, from_address, amount, token, memo, created_at 
-        FROM transactions 
-        WHERE LOWER(to_address)=? 
-        ORDER BY created_at DESC LIMIT 10""",
-        (user_address,)
-    )
-    received_txs = cur.fetchall()
-    
-    conn.close()
+    try:
+        with get_db_connection() as conn:
+            cur = conn.cursor()
+            
+            cur.execute(
+                """SELECT tx_hash, to_address, amount, token, memo, created_at 
+                FROM transactions 
+                WHERE LOWER(from_address)=? 
+                ORDER BY created_at DESC LIMIT 10""",
+                (user_address,)
+            )
+            sent_txs = cur.fetchall()
+            
+            cur.execute(
+                """SELECT tx_hash, from_address, amount, token, memo, created_at 
+                FROM transactions 
+                WHERE LOWER(to_address)=? 
+                ORDER BY created_at DESC LIMIT 10""",
+                (user_address,)
+            )
+            received_txs = cur.fetchall()
+    except Exception as e:
+        await q.message.reply_text(f"❌ Error loading history: {e}")
+        return
     
     msg = "📊 <b>Transaction History</b>\n\n"
     
@@ -1046,24 +1114,32 @@ async def post_init(application):
 
 
 def main():
+    # Clean up old database if schema is outdated
     if os.path.exists(DB_FILE):
-        conn = sqlite3.connect(DB_FILE)
-        cur = conn.cursor()
         try:
-            cur.execute("PRAGMA table_info(wallets)")
-            columns = [row[1] for row in cur.fetchall()]
-            if 'tempo_address' not in columns:
-                raise sqlite3.OperationalError("Old schema")
-            cur.execute("SELECT tempo_address FROM wallets LIMIT 1")
-            conn.close()
-        except sqlite3.OperationalError:
-            conn.close()
-            print("⚠️  Old database schema detected. Removing...")
-            os.remove(DB_FILE)
-            print("✓ Old database removed. Creating new one...")
+            with get_db_connection() as conn:
+                cur = conn.cursor()
+                cur.execute("PRAGMA table_info(wallets)")
+                columns = [row[1] for row in cur.fetchall()]
+                if 'tempo_address' not in columns:
+                    raise sqlite3.OperationalError("Old schema")
+                cur.execute("SELECT tempo_address FROM wallets LIMIT 1")
+        except (sqlite3.OperationalError, Exception) as e:
+            print(f"⚠️  Old or locked database detected: {e}")
+            print("⚠️  Removing old database...")
+            try:
+                os.remove(DB_FILE)
+                print("✓ Old database removed. Creating new one...")
+            except Exception as remove_error:
+                print(f"✗ Could not remove database: {remove_error}")
+                print("⚠️  Attempting to continue anyway...")
     
-    init_db()
-    print("✓ Database initialized")
+    # Initialize database with retry logic
+    try:
+        init_db()
+    except Exception as e:
+        print(f"✗ Failed to initialize database: {e}")
+        print("⚠️  Bot may not function correctly")
 
     app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
 
@@ -1086,10 +1162,11 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     print("=" * 50)
-    print("🚀 Tempo Payment Bot with Import/Export")
+    print("🚀 Tempo Payment Bot - Railway Optimized")
     print("=" * 50)
     print(f"✓ Tempo RPC: {TEMPO_RPC}")
     print(f"✓ Chain ID: {TEMPO_CHAIN_ID}")
+    print(f"✓ Database: WAL mode with {DB_TIMEOUT}s timeout")
     print(f"✓ Import/Export Wallet: Enabled")
     print(f"✓ Auto-delete sensitive messages: 60s")
     print(f"✓ Notification system: Active")
