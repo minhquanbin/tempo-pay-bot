@@ -1,4 +1,4 @@
-# bot.py — Tempo Payment Bot - Railway Optimized with Network Resilience
+# bot.py — Tempo Payment Bot - Fixed Notification System
 
 import time
 import sqlite3
@@ -40,7 +40,7 @@ if not BOT_TOKEN:
     exit(1)
 
 TEMPO_RPC = "https://rpc.testnet.tempo.xyz"
-TEMPO_CHAIN_ID = 42429
+TEMPO_CHAIN_ID = 41454
 TEMPO_FAUCET = "https://docs.tempo.xyz/quickstart/faucet"
 
 DB_FILE = "tempo.db"
@@ -50,7 +50,7 @@ RPC_CALL_DELAY = 2.0
 MAX_RETRIES = 3
 RETRY_DELAY = 5.0
 
-# Telegram connection settings for Railway
+# Telegram connection settings
 TELEGRAM_CONNECT_TIMEOUT = 60.0
 TELEGRAM_READ_TIMEOUT = 60.0
 TELEGRAM_WRITE_TIMEOUT = 60.0
@@ -133,11 +133,10 @@ else:
 
 bot_instance = None
 
-# ================= DATABASE WITH PROPER LOCKING =================
+# ================= DATABASE =================
 
 @contextmanager
 def get_db_connection():
-    """Context manager for database connections with proper timeout and isolation"""
     conn = None
     try:
         conn = sqlite3.connect(
@@ -160,7 +159,6 @@ def get_db_connection():
 
 
 def init_db():
-    """Initialize database with retry logic"""
     max_attempts = 5
     for attempt in range(max_attempts):
         try:
@@ -389,39 +387,48 @@ def delete_recipient(tg_id, nickname):
         return False
 
 
-# ================= NOTIFICATION SYSTEM =================
+# ================= IMPROVED NOTIFICATION SYSTEM =================
 
-async def send_payment_notification(telegram_id, from_addr, amount, token, memo, tx_hash):
+async def send_instant_notification(bot, telegram_id, from_addr, amount, token, memo, tx_hash):
+    """Send notification immediately after transaction"""
     try:
-        token_cfg = TEMPO_TOKENS[token]
+        if not bot:
+            print("✗ Bot instance not available")
+            return False
+            
+        token_cfg = TEMPO_TOKENS.get(token)
+        if not token_cfg:
+            print(f"✗ Unknown token: {token}")
+            return False
+            
         explorer_url = f"https://explore.tempo.xyz/tx/{tx_hash}"
-        
         from_short = f"{from_addr[:6]}...{from_addr[-4:]}"
         
         message = (
             f"💰 <b>Payment Received!</b>\n\n"
-            f"Amount: <b>{amount} {token_cfg['symbol']}</b>\n"
-            f"From: <code>{from_short}</code>\n"
-            f"Memo: {memo}\n\n"
+            f"📥 Amount: <b>{amount} {token_cfg['symbol']}</b>\n"
+            f"📤 From: <code>{from_short}</code>\n"
+            f"📝 Memo: <i>{memo}</i>\n\n"
             f"🔗 <a href='{explorer_url}'>View Transaction</a>"
         )
         
-        await bot_instance.send_message(
+        await bot.send_message(
             chat_id=telegram_id,
             text=message,
             parse_mode="HTML",
             disable_web_page_preview=True
         )
         
-        print(f"✓ Notification sent to user {telegram_id}")
+        print(f"✓ Instant notification sent to user {telegram_id}")
         return True
         
     except Exception as e:
-        print(f"✗ Failed to send notification: {e}")
+        print(f"✗ Failed to send instant notification: {e}")
         return False
 
 
 async def check_pending_notifications():
+    """Background worker to retry failed notifications"""
     try:
         with get_db_connection() as conn:
             cur = conn.cursor()
@@ -437,8 +444,9 @@ async def check_pending_notifications():
             recipient_tg_id = get_telegram_id_by_address(to_addr)
             
             if recipient_tg_id and recipient_tg_id != from_tg_id:
-                success = await send_payment_notification(
-                    recipient_tg_id, from_addr, amount, token, memo, tx_hash
+                print(f"🔄 Retrying notification for tx {tx_hash[:10]}... to user {recipient_tg_id}")
+                success = await send_instant_notification(
+                    bot_instance, recipient_tg_id, from_addr, amount, token, memo, tx_hash
                 )
                 
                 if success:
@@ -449,6 +457,7 @@ async def check_pending_notifications():
 
 
 async def notification_worker(application):
+    """Background worker for retry logic"""
     global bot_instance
     bot_instance = application.bot
     
@@ -463,7 +472,7 @@ async def notification_worker(application):
             await asyncio.sleep(60)
 
 
-# ================= RATE-LIMITED RPC HELPERS =================
+# ================= RPC HELPERS =================
 
 @rate_limited_rpc_call
 def get_balance(address):
@@ -544,7 +553,8 @@ async def wallet_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"<code>{w[0]}</code>\n\n"
                 f"💰 <b>Balance:</b>\n"
                 f"TEMO: {native_eth:.4f}\n\n"
-                f"🔔 Notifications: <b>Enabled</b>\n\n"
+                f"🔔 Notifications: <b>Enabled</b>\n"
+                f"📱 Telegram ID: <code>{q.from_user.id}</code>\n\n"
                 f"🚰 Get testnet tokens: {TEMPO_FAUCET}"
             )
             
@@ -564,7 +574,8 @@ async def wallet_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"👛 <b>Your Tempo Wallet</b>\n\n"
                 f"<code>{w[0]}</code>\n\n"
                 f"⚠️ <i>Could not fetch balance (RPC rate limited)</i>\n\n"
-                f"🔔 Notifications: <b>Enabled</b>\n\n"
+                f"🔔 Notifications: <b>Enabled</b>\n"
+                f"📱 Telegram ID: <code>{q.from_user.id}</code>\n\n"
                 f"🚰 Get testnet tokens: {TEMPO_FAUCET}"
             )
             await q.message.reply_text(
@@ -587,7 +598,8 @@ async def create_wallet_handler(update: Update, context: ContextTypes.DEFAULT_TY
             f"<code>{addr}</code>\n\n"
             f"💡 Fund this wallet to start sending payments\n"
             f"🚰 Faucet: {TEMPO_FAUCET}\n\n"
-            f"🔔 You'll receive notifications when someone sends you payment!",
+            f"🔔 You'll receive notifications when someone sends you payment!\n"
+            f"📱 Your Telegram ID: <code>{q.from_user.id}</code>",
             parse_mode="HTML"
         )
     else:
@@ -657,7 +669,7 @@ async def history_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     wallet = get_wallet(q.from_user.id)
     if not wallet:
-        await q.message.reply_text("No wallet found")
+        await q.message.reply_text("❌ No wallet found")
         return
     
     user_address = wallet[0].lower()
@@ -790,7 +802,7 @@ async def send_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()
 
     if not get_wallet(q.from_user.id):
-        await q.message.reply_text("You don't have a wallet yet. Choose 'My Wallet' first.")
+        await q.message.reply_text("❌ You don't have a wallet yet. Choose 'My Wallet' first.")
         return
 
     keyboard = [
@@ -842,7 +854,7 @@ async def use_saved_recipient(update: Update, context: ContextTypes.DEFAULT_TYPE
     ]
     
     await q.message.reply_text(
-        "Select recipient:",
+        "📋 Select recipient:",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
@@ -855,7 +867,7 @@ async def select_saved_recipient(update: Update, context: ContextTypes.DEFAULT_T
     recipient_data = get_recipient_by_nickname(q.from_user.id, nickname)
     
     if not recipient_data:
-        await q.message.reply_text("Recipient not found")
+        await q.message.reply_text("❌ Recipient not found")
         return
     
     context.user_data["to"] = recipient_data[0]
@@ -863,7 +875,7 @@ async def select_saved_recipient(update: Update, context: ContextTypes.DEFAULT_T
     context.user_data["step"] = "amount"
     
     await q.message.reply_text(
-        f"Recipient: <b>{nickname}</b>\n"
+        f"✅ Recipient: <b>{nickname}</b>\n"
         f"<code>{recipient_data[0]}</code>\n\n"
         f"Enter amount to send:",
         parse_mode="HTML"
@@ -885,6 +897,48 @@ async def back_to_main(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await start(update, context)
 
 
+# ================= DEBUG COMMANDS =================
+
+async def check_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Check if user is registered"""
+    wallet = get_wallet(update.effective_user.id)
+    if wallet:
+        await update.message.reply_text(
+            f"✅ <b>You are registered!</b>\n\n"
+            f"Address: <code>{wallet[0]}</code>\n"
+            f"Telegram ID: <code>{update.effective_user.id}</code>\n\n"
+            f"🔔 You will receive notifications when someone sends you payment!",
+            parse_mode="HTML"
+        )
+    else:
+        await update.message.reply_text(
+            "❌ <b>You are not registered yet.</b>\n\n"
+            "Use /start to create a wallet.",
+            parse_mode="HTML"
+        )
+
+
+async def test_notification(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Test notification system"""
+    await update.message.reply_text(
+        "🧪 <b>Testing notification...</b>\n\n"
+        "Sending test message to yourself...",
+        parse_mode="HTML"
+    )
+    
+    try:
+        await context.bot.send_message(
+            chat_id=update.effective_user.id,
+            text="✅ <b>Test notification successful!</b> 🎉\n\nNotification system is working!",
+            parse_mode="HTML"
+        )
+        await update.message.reply_text("✅ Notification system is working!")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Notification failed: {e}")
+
+
+# ================= TEXT HANDLER =================
+
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     action = context.user_data.get("action")
     step = context.user_data.get("step")
@@ -892,6 +946,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not step and not action:
         return
     
+    # IMPORT WALLET FLOW
     if action == "import_wallet":
         private_key = update.message.text.strip()
         
@@ -909,7 +964,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(
                 f"✅ <b>Wallet imported successfully!</b>\n\n"
                 f"<code>{addr}</code>\n\n"
-                f"🔔 You'll receive notifications when someone sends you payment!",
+                f"🔔 You'll receive notifications when someone sends you payment!\n"
+                f"📱 Your Telegram ID: <code>{update.effective_user.id}</code>",
                 parse_mode="HTML"
             )
         else:
@@ -922,11 +978,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.clear()
         return
     
+    # ADD RECIPIENT FLOW
     if action == "add_recipient":
         if step == "nickname":
             nickname = update.message.text.strip()
             if len(nickname) < 2 or len(nickname) > 20:
-                await update.message.reply_text("Nickname must be 2-20 characters")
+                await update.message.reply_text("❌ Nickname must be 2-20 characters")
                 return
             
             context.user_data["recipient_nickname"] = nickname
@@ -938,7 +995,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             address = update.message.text.strip()
             
             if not Web3.is_address(address):
-                await update.message.reply_text("Invalid address. Try again:")
+                await update.message.reply_text("❌ Invalid address. Try again:")
                 return
             
             nickname = context.user_data["recipient_nickname"]
@@ -958,11 +1015,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data.clear()
             return
     
+    # SEND PAYMENT FLOW
     if step == "to":
         to_address = update.message.text.strip()
         
         if not Web3.is_address(to_address):
-            await update.message.reply_text("Invalid address. Please try again:")
+            await update.message.reply_text("❌ Invalid address. Please try again:")
             return
         
         context.user_data["to"] = to_address
@@ -977,15 +1035,15 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 raise ValueError("Amount must be positive")
             context.user_data["amount"] = amount
         except:
-            await update.message.reply_text("Invalid amount. Please try again:")
+            await update.message.reply_text("❌ Invalid amount. Please try again:")
             return
 
         context.user_data["step"] = "memo"
         await update.message.reply_text(
-            "Enter payment memo:\n\n"
+            "📝 <b>Enter payment memo:</b>\n\n"
             "Example: <i>INVOICE123456</i>\n"
             "Or: <i>Payment for services</i>\n\n"
-            "This memo will be stored onchain",
+            "💡 This memo will be stored onchain",
             parse_mode="HTML"
         )
         return
@@ -994,10 +1052,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         memo = update.message.text.strip()
         
         if not memo:
-            await update.message.reply_text("Memo cannot be empty. Please try again:")
+            await update.message.reply_text("❌ Memo cannot be empty. Please try again:")
             return
 
-        processing_msg = await update.message.reply_text("⏳ Processing transaction...\n<i>This may take 10-15 seconds due to rate limits</i>", parse_mode="HTML")
+        processing_msg = await update.message.reply_text(
+            "⏳ <b>Processing transaction...</b>\n"
+            "<i>This may take 10-15 seconds due to rate limits</i>",
+            parse_mode="HTML"
+        )
 
         token = context.user_data.get("token")
         to = context.user_data.get("to")
@@ -1049,16 +1111,19 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "data": transfer_function._encode_transaction_data(),
             }
 
+            # Append memo
             memo_bytes = memo.encode('utf-8')
             memo_hex = memo_bytes.hex()
             tx_dict["data"] = tx_dict["data"] + memo_hex
 
+            # Sign and send
             signed_tx = w3.eth.account.sign_transaction(tx_dict, acct.key)
             tx_hash = await send_raw_transaction(signed_tx.rawTransaction)
             
             tx_hash_hex = tx_hash.hex()
             explorer_url = f"https://explore.tempo.xyz/tx/{tx_hash_hex}"
 
+            # Save transaction
             save_transaction(
                 tx_hash_hex,
                 update.effective_user.id,
@@ -1069,19 +1134,64 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 memo
             )
 
-            if recipient_nickname:
-                recipient_display = f"{recipient_nickname}\n{to[:10]}...{to[-8:]}"
+            # ✅ SEND INSTANT NOTIFICATION
+            recipient_tg_id = get_telegram_id_by_address(to)
+            
+            print(f"\n{'='*50}")
+            print(f"📤 NOTIFICATION CHECK")
+            print(f"{'='*50}")
+            print(f"Sender: {update.effective_user.id} ({acct.address[:10]}...)")
+            print(f"Recipient Address: {to}")
+            print(f"Recipient TG ID: {recipient_tg_id}")
+            print(f"Amount: {amount} {token}")
+            print(f"Memo: {memo}")
+            print(f"TX Hash: {tx_hash_hex[:10]}...")
+            print(f"{'='*50}\n")
+            
+            if recipient_tg_id and recipient_tg_id != update.effective_user.id:
+                print(f"✓ Recipient found in database!")
+                print(f"📨 Sending instant notification to user {recipient_tg_id}...")
+                
+                try:
+                    notification_sent = await send_instant_notification(
+                        context.bot,
+                        recipient_tg_id,
+                        acct.address,
+                        str(amount),
+                        token,
+                        memo,
+                        tx_hash_hex
+                    )
+                    
+                    if notification_sent:
+                        mark_notification_sent(tx_hash_hex)
+                        print(f"✓ Notification sent and marked as sent!")
+                    else:
+                        print(f"✗ Notification failed, will retry via worker")
+                        
+                except Exception as notif_error:
+                    print(f"✗ Notification error: {notif_error}")
             else:
-                recipient_display = f"{to[:10]}...{to[-8:]}"
+                if not recipient_tg_id:
+                    print(f"ℹ️  Recipient address {to} not registered in bot")
+                    print(f"   They need to /start the bot to receive notifications")
+                else:
+                    print(f"ℹ️  Self-payment detected, skipping notification")
+
+            # Format recipient display
+            if recipient_nickname:
+                recipient_display = f"<b>{recipient_nickname}</b>\n<code>{to[:10]}...{to[-8:]}</code>"
+            else:
+                recipient_display = f"<code>{to[:10]}...{to[-8:]}</code>"
 
             await processing_msg.edit_text(
                 f"✅ <b>Payment sent successfully!</b>\n\n"
                 f"💰 Token: <b>{token}</b>\n"
                 f"📊 Amount: <b>{amount} {cfg['symbol']}</b>\n"
-                f"👤 Recipient: <code>{recipient_display}</code>\n"
+                f"👤 Recipient: {recipient_display}\n"
                 f"📝 Memo: <i>{memo}</i>\n\n"
                 f"🔗 <a href='{explorer_url}'>View on Explorer</a>\n\n"
-                f"🔔 Recipient will be notified if they use this bot!",
+                f"{'🔔 Recipient notified!' if recipient_tg_id and recipient_tg_id != update.effective_user.id else '💡 Recipient will be notified if they use this bot'}",
                 parse_mode="HTML",
                 disable_web_page_preview=True
             )
@@ -1115,7 +1225,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
 
+# ================= MAIN =================
+
 async def post_init(application):
+    """Initialize background workers"""
     asyncio.create_task(notification_worker(application))
 
 
@@ -1125,7 +1238,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 def main():
-    # Clean up old database if schema is outdated
+    # Clean up old database if needed
     if os.path.exists(DB_FILE):
         try:
             with get_db_connection() as conn:
@@ -1143,16 +1256,14 @@ def main():
                 print("✓ Old database removed. Creating new one...")
             except Exception as remove_error:
                 print(f"✗ Could not remove database: {remove_error}")
-                print("⚠️  Attempting to continue anyway...")
     
-    # Initialize database with retry logic
+    # Initialize database
     try:
         init_db()
     except Exception as e:
         print(f"✗ Failed to initialize database: {e}")
-        print("⚠️  Bot may not function correctly")
 
-    # Configure request with extended timeouts for Railway
+    # Configure request with extended timeouts
     request = HTTPXRequest(
         connect_timeout=TELEGRAM_CONNECT_TIMEOUT,
         read_timeout=TELEGRAM_READ_TIMEOUT,
@@ -1160,8 +1271,7 @@ def main():
         pool_timeout=TELEGRAM_POOL_TIMEOUT,
     )
 
-    # Build application with custom request configuration
-    # NOTE: Don't use .connect_timeout() etc when using custom request
+    # Build application
     app = (
         ApplicationBuilder()
         .token(BOT_TOKEN)
@@ -1173,7 +1283,12 @@ def main():
     # Add error handler
     app.add_error_handler(error_handler)
 
+    # Command handlers
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("check", check_user))
+    app.add_handler(CommandHandler("test", test_notification))
+    
+    # Callback handlers
     app.add_handler(CallbackQueryHandler(wallet_menu, pattern="^wallet$"))
     app.add_handler(CallbackQueryHandler(create_wallet_handler, pattern="^create_wallet$"))
     app.add_handler(CallbackQueryHandler(import_wallet_handler, pattern="^import_wallet$"))
@@ -1189,23 +1304,24 @@ def main():
     app.add_handler(CallbackQueryHandler(select_saved_recipient, pattern="^recipient:"))
     app.add_handler(CallbackQueryHandler(enter_new_address, pattern="^enter_new_address$"))
     app.add_handler(CallbackQueryHandler(back_to_main, pattern="^back_main$"))
+    
+    # Text handler
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    print("=" * 50)
-    print("🚀 Tempo Payment Bot - Railway Optimized")
-    print("=" * 50)
+    print("=" * 60)
+    print("🚀 Tempo Payment Bot - NOTIFICATION SYSTEM FIXED")
+    print("=" * 60)
     print(f"✓ Tempo RPC: {TEMPO_RPC}")
     print(f"✓ Chain ID: {TEMPO_CHAIN_ID}")
     print(f"✓ Database: WAL mode with {DB_TIMEOUT}s timeout")
-    print(f"✓ Telegram timeouts: {TELEGRAM_CONNECT_TIMEOUT}s")
-    print(f"✓ Import/Export Wallet: Enabled")
-    print(f"✓ Auto-delete sensitive messages: 60s")
-    print(f"✓ Notification system: Active")
-    print("=" * 50)
+    print(f"✓ Instant Notifications: ENABLED")
+    print(f"✓ Background Worker: ENABLED (retry every 30s)")
+    print(f"✓ Debug Commands: /check /test")
+    print("=" * 60)
     print("Bot is running... Press Ctrl+C to stop")
-    print("=" * 50)
+    print("=" * 60)
     
-    # Start polling with extended timeouts
+    # Start polling
     app.run_polling(
         allowed_updates=Update.ALL_TYPES,
         drop_pending_updates=True,
