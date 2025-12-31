@@ -1161,14 +1161,11 @@ def main():
     )
 
     # Build application with custom request configuration
+    # NOTE: Don't use .connect_timeout() etc when using custom request
     app = (
         ApplicationBuilder()
         .token(BOT_TOKEN)
         .request(request)
-        .connect_timeout(TELEGRAM_CONNECT_TIMEOUT)
-        .read_timeout(TELEGRAM_READ_TIMEOUT)
-        .write_timeout(TELEGRAM_WRITE_TIMEOUT)
-        .pool_timeout(TELEGRAM_POOL_TIMEOUT)
         .post_init(post_init)
         .build()
     )
@@ -1208,7 +1205,12 @@ def main():
     print("Bot is running... Press Ctrl+C to stop")
     print("=" * 50)
     
-    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+    # Start polling with extended timeouts
+    app.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True,
+        close_loop=False
+    )
 
 
 if __name__ == "__main__":
