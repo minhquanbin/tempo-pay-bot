@@ -1,4 +1,4 @@
-# bot.py — Tempo Payment Bot with Import/Export Wallet (Fixed for Railway)
+# bot.py — Tempo Payment Bot - Railway Optimized with Network Resilience
 
 import time
 import sqlite3
@@ -23,6 +23,7 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
+from telegram.request import HTTPXRequest
 
 from web3 import Web3
 from eth_account import Account
@@ -43,11 +44,17 @@ TEMPO_CHAIN_ID = 42429
 TEMPO_FAUCET = "https://docs.tempo.xyz/quickstart/faucet"
 
 DB_FILE = "tempo.db"
-DB_TIMEOUT = 30.0  # Increased timeout for Railway
+DB_TIMEOUT = 30.0
 
 RPC_CALL_DELAY = 2.0
 MAX_RETRIES = 3
 RETRY_DELAY = 5.0
+
+# Telegram connection settings for Railway
+TELEGRAM_CONNECT_TIMEOUT = 60.0
+TELEGRAM_READ_TIMEOUT = 60.0
+TELEGRAM_WRITE_TIMEOUT = 60.0
+TELEGRAM_POOL_TIMEOUT = 60.0
 
 TEMPO_TOKENS = {
     "AlphaUSD": {
@@ -139,8 +146,8 @@ def get_db_connection():
             isolation_level='DEFERRED',
             check_same_thread=False
         )
-        conn.execute("PRAGMA journal_mode=WAL")  # Write-Ahead Logging for better concurrency
-        conn.execute("PRAGMA busy_timeout=30000")  # 30 second busy timeout
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=30000")
         yield conn
         conn.commit()
     except Exception as e:
@@ -215,7 +222,6 @@ def init_db():
                 
                 cur.execute("INSERT OR IGNORE INTO sync_state (id, last_block) VALUES (1, 0)")
                 
-                # Create indexes for better performance
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_transactions_from ON transactions(from_address)")
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_transactions_to ON transactions(to_address)")
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_transactions_notification ON transactions(notification_sent)")
@@ -226,7 +232,7 @@ def init_db():
         except sqlite3.OperationalError as e:
             if "locked" in str(e).lower():
                 print(f"✗ Database locked, attempt {attempt + 1}/{max_attempts}")
-                time.sleep(2 ** attempt)  # Exponential backoff
+                time.sleep(2 ** attempt)
                 continue
             raise e
         except Exception as e:
@@ -716,7 +722,7 @@ async def recipients_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     recipients = get_recipients(q.from_user.id)
     
     if not recipients:
-        keyboard = [[InlineKeyboardButton("➕ Add Recipient", callback_data="add_recipient")]]
+        keyboard = [[InlineKeyboardButton("➕ Add Recipient", callback_data="add_recipient")], [InlineKeyboardButton("🔙 Back", callback_data="back_main")]]
         await q.message.reply_text(
             "📋 <b>Saved Recipients</b>\n\n"
             "<i>No saved recipients yet.</i>\n\n"
@@ -1113,6 +1119,11 @@ async def post_init(application):
     asyncio.create_task(notification_worker(application))
 
 
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Log errors caused by Updates."""
+    print(f"✗ Update {update} caused error {context.error}")
+
+
 def main():
     # Clean up old database if schema is outdated
     if os.path.exists(DB_FILE):
@@ -1141,7 +1152,29 @@ def main():
         print(f"✗ Failed to initialize database: {e}")
         print("⚠️  Bot may not function correctly")
 
-    app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
+    # Configure request with extended timeouts for Railway
+    request = HTTPXRequest(
+        connect_timeout=TELEGRAM_CONNECT_TIMEOUT,
+        read_timeout=TELEGRAM_READ_TIMEOUT,
+        write_timeout=TELEGRAM_WRITE_TIMEOUT,
+        pool_timeout=TELEGRAM_POOL_TIMEOUT,
+    )
+
+    # Build application with custom request configuration
+    app = (
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        .request(request)
+        .connect_timeout(TELEGRAM_CONNECT_TIMEOUT)
+        .read_timeout(TELEGRAM_READ_TIMEOUT)
+        .write_timeout(TELEGRAM_WRITE_TIMEOUT)
+        .pool_timeout(TELEGRAM_POOL_TIMEOUT)
+        .post_init(post_init)
+        .build()
+    )
+
+    # Add error handler
+    app.add_error_handler(error_handler)
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(wallet_menu, pattern="^wallet$"))
@@ -1167,6 +1200,7 @@ def main():
     print(f"✓ Tempo RPC: {TEMPO_RPC}")
     print(f"✓ Chain ID: {TEMPO_CHAIN_ID}")
     print(f"✓ Database: WAL mode with {DB_TIMEOUT}s timeout")
+    print(f"✓ Telegram timeouts: {TELEGRAM_CONNECT_TIMEOUT}s")
     print(f"✓ Import/Export Wallet: Enabled")
     print(f"✓ Auto-delete sensitive messages: 60s")
     print(f"✓ Notification system: Active")
@@ -1174,7 +1208,7 @@ def main():
     print("Bot is running... Press Ctrl+C to stop")
     print("=" * 50)
     
-    app.run_polling()
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
 if __name__ == "__main__":
