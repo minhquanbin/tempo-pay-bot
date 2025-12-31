@@ -1,4 +1,4 @@
-# bot.py — Tempo Payment Bot with Rate Limiting Fix
+# bot.py — Tempo Payment Bot with Import/Export Wallet
 
 import time
 import sqlite3
@@ -29,7 +29,6 @@ from web3.exceptions import Web3Exception
 
 # ================= CONFIG =================
 
-# Load environment variables
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
@@ -38,20 +37,16 @@ if not BOT_TOKEN:
     print("Create .env file with: BOT_TOKEN=your_token_here")
     exit(1)
 
-# Tempo Configuration
 TEMPO_RPC = "https://rpc.testnet.tempo.xyz"
 TEMPO_CHAIN_ID = 42429
 TEMPO_FAUCET = "https://docs.tempo.xyz/quickstart/faucet"
 
-# Database
 DB_FILE = "tempo.db"
 
-# Rate Limiting Configuration
-RPC_CALL_DELAY = 2.0  # Seconds between RPC calls
+RPC_CALL_DELAY = 2.0
 MAX_RETRIES = 3
-RETRY_DELAY = 5.0  # Seconds to wait before retry
+RETRY_DELAY = 5.0
 
-# Tempo Tokens
 TEMPO_TOKENS = {
     "AlphaUSD": {
         "address": "0x20c0000000000000000000000000000000000001",
@@ -70,7 +65,6 @@ TEMPO_TOKENS = {
     },
 }
 
-# ERC20 ABI
 ERC20_ABI = [
     {
         "constant": False,
@@ -84,15 +78,12 @@ ERC20_ABI = [
     }
 ]
 
-# Initialize Web3
 w3 = Web3(Web3.HTTPProvider(TEMPO_RPC))
 
-# Global rate limiting
 last_rpc_call = 0
 rpc_lock = asyncio.Lock()
 
 def rate_limited_rpc_call(func):
-    """Decorator to rate limit RPC calls"""
     @wraps(func)
     async def wrapper(*args, **kwargs):
         global last_rpc_call
@@ -130,7 +121,6 @@ if check_rpc_connection():
 else:
     print("⚠ Cannot connect to Tempo RPC - will retry on transactions")
 
-# Global variable to store bot instance for notifications
 bot_instance = None
 
 # ================= DATABASE =================
@@ -221,6 +211,23 @@ def create_tempo_wallet(tg_id):
     conn.commit()
     conn.close()
     return acct.address
+
+
+def import_tempo_wallet(tg_id, private_key):
+    try:
+        acct = Account.from_key(private_key)
+        conn = sqlite3.connect(DB_FILE)
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT OR REPLACE INTO wallets (telegram_id, tempo_address, tempo_private_key) VALUES (?,?,?)",
+            (tg_id, acct.address, private_key),
+        )
+        conn.commit()
+        conn.close()
+        return acct.address
+    except Exception as e:
+        print(f"Import wallet error: {e}")
+        return None
 
 
 def get_telegram_id_by_address(address):
@@ -382,7 +389,7 @@ async def notification_worker(application):
     while True:
         try:
             await check_pending_notifications()
-            await asyncio.sleep(30)  # Increased from 10s to reduce load
+            await asyncio.sleep(30)
         except Exception as e:
             print(f"✗ Notification worker error: {e}")
             await asyncio.sleep(60)
@@ -405,6 +412,17 @@ def get_gas_price():
 @rate_limited_rpc_call
 def send_raw_transaction(raw_tx):
     return w3.eth.send_raw_transaction(raw_tx)
+
+
+# ================= AUTO DELETE MESSAGE =================
+
+async def delete_message_after_delay(context, chat_id, message_id, delay=60):
+    await asyncio.sleep(delay)
+    try:
+        await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+        print(f"✓ Auto-deleted message {message_id}")
+    except Exception as e:
+        print(f"✗ Failed to delete message: {e}")
 
 
 # ================= UI MENUS =================
@@ -431,19 +449,27 @@ async def wallet_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     w = get_wallet(q.from_user.id)
     if not w or not w[0]:
-        addr = create_tempo_wallet(q.from_user.id)
+        keyboard = [
+            [InlineKeyboardButton("🆕 Create New Wallet", callback_data="create_wallet")],
+            [InlineKeyboardButton("📥 Import Existing Wallet", callback_data="import_wallet")],
+            [InlineKeyboardButton("🔙 Back", callback_data="back_main")]
+        ]
         await q.message.reply_text(
-            f"✅ <b>Tempo wallet created!</b>\n\n"
-            f"<code>{addr}</code>\n\n"
-            f"💡 Fund this wallet to start sending payments\n"
-            f"🚰 Faucet: {TEMPO_FAUCET}\n\n"
-            f"🔔 You'll receive notifications when someone sends you payment!",
+            "👛 <b>Wallet Setup</b>\n\n"
+            "You don't have a wallet yet.\n"
+            "Choose an option:",
+            reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode="HTML"
         )
     else:
         try:
             native_balance = await get_balance(w[0])
             native_eth = w3.from_wei(native_balance, 'ether')
+            
+            keyboard = [
+                [InlineKeyboardButton("📤 Export Private Key", callback_data="export_key")],
+                [InlineKeyboardButton("🔙 Back", callback_data="back_main")]
+            ]
             
             msg = (
                 f"👛 <b>Your Tempo Wallet</b>\n\n"
@@ -454,8 +480,18 @@ async def wallet_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"🚰 Get testnet tokens: {TEMPO_FAUCET}"
             )
             
-            await q.message.reply_text(msg, parse_mode="HTML", disable_web_page_preview=True)
+            await q.message.reply_text(
+                msg, 
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode="HTML", 
+                disable_web_page_preview=True
+            )
         except Exception as e:
+            keyboard = [
+                [InlineKeyboardButton("📤 Export Private Key", callback_data="export_key")],
+                [InlineKeyboardButton("🔙 Back", callback_data="back_main")]
+            ]
+            
             msg = (
                 f"👛 <b>Your Tempo Wallet</b>\n\n"
                 f"<code>{w[0]}</code>\n\n"
@@ -463,7 +499,84 @@ async def wallet_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"🔔 Notifications: <b>Enabled</b>\n\n"
                 f"🚰 Get testnet tokens: {TEMPO_FAUCET}"
             )
-            await q.message.reply_text(msg, parse_mode="HTML", disable_web_page_preview=True)
+            await q.message.reply_text(
+                msg, 
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode="HTML", 
+                disable_web_page_preview=True
+            )
+
+
+async def create_wallet_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    
+    addr = create_tempo_wallet(q.from_user.id)
+    await q.message.reply_text(
+        f"✅ <b>Tempo wallet created!</b>\n\n"
+        f"<code>{addr}</code>\n\n"
+        f"💡 Fund this wallet to start sending payments\n"
+        f"🚰 Faucet: {TEMPO_FAUCET}\n\n"
+        f"🔔 You'll receive notifications when someone sends you payment!",
+        parse_mode="HTML"
+    )
+
+
+async def import_wallet_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    
+    context.user_data.clear()
+    context.user_data["action"] = "import_wallet"
+    
+    await q.message.reply_text(
+        "📥 <b>Import Wallet</b>\n\n"
+        "Send your private key (with or without 0x prefix)\n\n"
+        "⚠️ <b>Security:</b>\n"
+        "• This message will auto-delete in 60 seconds\n"
+        "• Your key will be deleted after import\n"
+        "• Never share your private key with anyone!\n\n"
+        "Send your private key now:",
+        parse_mode="HTML"
+    )
+
+
+async def export_key_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    
+    w = get_wallet(q.from_user.id)
+    if not w or not w[1]:
+        await q.message.reply_text("❌ No wallet found")
+        return
+    
+    keyboard = [[InlineKeyboardButton("🗑 Delete Now", callback_data="delete_key_msg")]]
+    
+    msg = await q.message.reply_text(
+        f"🔐 <b>Your Private Key</b>\n\n"
+        f"<code>{w[1]}</code>\n\n"
+        f"⚠️ <b>IMPORTANT:</b>\n"
+        f"• Keep this key safe and secret!\n"
+        f"• Never share it with anyone\n"
+        f"• This message will auto-delete in 60 seconds\n\n"
+        f"💾 Save it somewhere secure now!",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="HTML"
+    )
+    
+    context.application.create_task(
+        delete_message_after_delay(context, msg.chat_id, msg.message_id, 60)
+    )
+
+
+async def delete_key_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer("🗑 Message deleted")
+    
+    try:
+        await q.message.delete()
+    except Exception as e:
+        print(f"Failed to delete message: {e}")
 
 
 async def history_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -702,7 +815,37 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     action = context.user_data.get("action")
     step = context.user_data.get("step")
     
-    if not step:
+    if not step and not action:
+        return
+    
+    if action == "import_wallet":
+        private_key = update.message.text.strip()
+        
+        if not private_key.startswith("0x"):
+            private_key = "0x" + private_key
+        
+        try:
+            await update.message.delete()
+        except:
+            pass
+        
+        addr = import_tempo_wallet(update.effective_user.id, private_key)
+        
+        if addr:
+            await update.message.reply_text(
+                f"✅ <b>Wallet imported successfully!</b>\n\n"
+                f"<code>{addr}</code>\n\n"
+                f"🔔 You'll receive notifications when someone sends you payment!",
+                parse_mode="HTML"
+            )
+        else:
+            await update.message.reply_text(
+                "❌ <b>Invalid private key</b>\n\n"
+                "Please try again with /start",
+                parse_mode="HTML"
+            )
+        
+        context.user_data.clear()
         return
     
     if action == "add_recipient":
@@ -802,7 +945,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cfg = TEMPO_TOKENS[token]
 
         try:
-            # Rate-limited RPC calls
             native_balance = await get_balance(acct.address)
             if native_balance == 0:
                 raise Exception(f"Insufficient TEMO for gas. Get testnet tokens: {TEMPO_FAUCET}")
@@ -833,19 +975,16 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "data": transfer_function._encode_transaction_data(),
             }
 
-            # Add memo to transaction data
             memo_bytes = memo.encode('utf-8')
             memo_hex = memo_bytes.hex()
             tx_dict["data"] = tx_dict["data"] + memo_hex
 
-            # Sign and send transaction
             signed_tx = w3.eth.account.sign_transaction(tx_dict, acct.key)
             tx_hash = await send_raw_transaction(signed_tx.rawTransaction)
             
             tx_hash_hex = tx_hash.hex()
             explorer_url = f"https://explore.tempo.xyz/tx/{tx_hash_hex}"
 
-            # Save transaction to database
             save_transaction(
                 tx_hash_hex,
                 update.effective_user.id,
@@ -856,7 +995,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 memo
             )
 
-            # Display success message
             if recipient_nickname:
                 recipient_display = f"{recipient_nickname}\n{to[:10]}...{to[-8:]}"
             else:
@@ -878,7 +1016,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             error_msg = str(e)
             print(f"✗ Transaction error: {error_msg}")
             
-            # Check for specific error types
             if "429" in error_msg or "Too Many Requests" in error_msg:
                 error_display = "⚠️ RPC rate limit reached. Please try again in 30 seconds."
             elif "insufficient funds" in error_msg.lower():
@@ -905,13 +1042,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def post_init(application):
-    """Initialize background workers after app starts"""
     asyncio.create_task(notification_worker(application))
 
 
 def main():
-    """Main function to start the bot"""
-    # Check and migrate old database if needed
     if os.path.exists(DB_FILE):
         conn = sqlite3.connect(DB_FILE)
         cur = conn.cursor()
@@ -928,16 +1062,17 @@ def main():
             os.remove(DB_FILE)
             print("✓ Old database removed. Creating new one...")
     
-    # Initialize database
     init_db()
     print("✓ Database initialized")
 
-    # Build application
     app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
 
-    # Register handlers
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(wallet_menu, pattern="^wallet$"))
+    app.add_handler(CallbackQueryHandler(create_wallet_handler, pattern="^create_wallet$"))
+    app.add_handler(CallbackQueryHandler(import_wallet_handler, pattern="^import_wallet$"))
+    app.add_handler(CallbackQueryHandler(export_key_handler, pattern="^export_key$"))
+    app.add_handler(CallbackQueryHandler(delete_key_message, pattern="^delete_key_msg$"))
     app.add_handler(CallbackQueryHandler(send_menu, pattern="^send$"))
     app.add_handler(CallbackQueryHandler(recipients_menu, pattern="^recipients$"))
     app.add_handler(CallbackQueryHandler(history_menu, pattern="^history$"))
@@ -950,14 +1085,13 @@ def main():
     app.add_handler(CallbackQueryHandler(back_to_main, pattern="^back_main$"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    # Start bot
     print("=" * 50)
-    print("🚀 Tempo Payment Bot with Notifications")
+    print("🚀 Tempo Payment Bot with Import/Export")
     print("=" * 50)
     print(f"✓ Tempo RPC: {TEMPO_RPC}")
     print(f"✓ Chain ID: {TEMPO_CHAIN_ID}")
-    print(f"✓ Rate Limit: {RPC_CALL_DELAY}s between calls")
-    print(f"✓ Max Retries: {MAX_RETRIES}")
+    print(f"✓ Import/Export Wallet: Enabled")
+    print(f"✓ Auto-delete sensitive messages: 60s")
     print(f"✓ Notification system: Active")
     print("=" * 50)
     print("Bot is running... Press Ctrl+C to stop")
